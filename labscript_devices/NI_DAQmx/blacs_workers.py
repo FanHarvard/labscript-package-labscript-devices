@@ -31,7 +31,7 @@ from labscript_utils.connections import _ensure_str
 
 from blacs.tab_base_classes import Worker
 
-from .utils import split_conn_port, split_conn_DO, split_conn_AI
+from .utils import split_conn_port, split_conn_DO, split_conn_AI, split_conn_CI
 from .daqmx_utils import incomplete_sample_detection
 
 
@@ -40,7 +40,7 @@ class NI_DAQmxOutputWorker(Worker):
         self.check_version()
         # Reset Device: clears previously added routes etc. Note: is insufficient for
         # some devices, which require power cycling to truly reset.
-        DAQmxResetDevice(self.MAX_name)
+        DAQmxResetDevice(self.MAX_name) #TODO
         self.start_manual_mode_tasks()
 
     def stop_tasks(self):
@@ -79,7 +79,8 @@ class NI_DAQmxOutputWorker(Worker):
             self.AO_task = None
 
         if self.ports:
-            self.DO_task = Task()
+            self.DO_task = None
+            # self.DO_task = Task() # TODO
         else:
             self.DO_task = None
 
@@ -96,7 +97,7 @@ class NI_DAQmxOutputWorker(Worker):
                 continue
             # Add each port to the task:
             con = '%s/%s' % (self.MAX_name, port_str)
-            self.DO_task.CreateDOChan(con, "", DAQmx_Val_ChanForAllLines)
+            # self.DO_task.CreateDOChan(con, "", DAQmx_Val_ChanForAllLines) # TODO
 
         # Start tasks:
         if self.AO_task is not None:
@@ -684,6 +685,178 @@ class NI_DAQmxAcquisitionWorker(Worker):
                 data['t'] = times
                 data['values'] = values
                 measurements.create_dataset(label, data=data)
+
+    def abort_buffered(self):
+        return self.transition_to_manual(True)
+
+    def abort_transition_to_buffered(self):
+        return self.transition_to_manual(True)
+
+    def program_manual(self, values):
+        return {}
+
+
+class NI_DAQmxCounterWorker(Worker):
+    """Counter acquisition using CI table gate windows."""
+
+    def init(self):
+        # Prevent interference between the read callback and the shutdown code:
+        self.tasklock = threading.RLock()
+
+        # Assigned on a per-task basis and cleared afterward:
+        # self.read_array = None
+        self.task = None
+
+        # Assigned on a per-shot basis and cleared afterward:
+        self.buffered_mode = False
+        self.h5_file = None
+        self.acquired_data = None
+        self.buffered_chans = None
+
+    def shutdown(self):
+        if self.task is not None:
+            self.stop_task()
+
+    def start_task(self, insts):
+        if self.task is not None:
+            raise RuntimeError('Task already running')
+
+        if insts is None:
+            return
+
+        self.task = []
+
+        for inst in insts:
+            self.task.append(Task())
+            self._set_count_task(self.task[-1], inst)
+
+        for task in self.task:
+            task.StartTask()
+
+    def stop_task(self):
+        with self.tasklock:
+            if self.task is None:
+                raise RuntimeError('Task not running')
+
+            for i_task, task in enumerate(self.task):
+                # Read remaining data:
+                count = uInt32()
+                task.ReadCounterScalarU32(1.0, count, None)
+                self.acquired_data[self.buffered_chans[i_task]] = count
+                # Stop the task:
+                task.StopTask()
+                task.ClearTask()
+
+            self.task = None
+
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
+        self.logger.debug('transition_to_buffered')
+
+        self.h5_file = h5file
+        with h5py.File(h5file, 'r') as f:
+            group = f['/devices/' + device_name]
+            if 'CI' not in group:
+                return initial_values
+            ci_table = group['CI'][:]
+
+        self.acquired_data = {}
+        self.buffered_chans = []
+        instructions = []
+
+        for row in ci_table:
+            chan = _ensure_str(row['connection'])
+            instructions.append(
+                {
+                    'label': _ensure_str(row['label']),
+                    'connection': chan,
+                    'edge': _ensure_str(row['edge terminal']),
+                    'gate': _ensure_str(row['gate terminal'])
+                }
+            )
+            self.buffered_chans.append(chan)
+        
+        self.buffered_mode = True
+        self.start_task(instructions)
+
+        return {}
+
+    def transition_to_manual(self, abort=False):
+        self.logger.debug('transition_to_manual')
+
+        if not self.buffered_mode:
+            return True
+        if self.buffered_chans is not None:
+            self.stop_task()
+        self.buffered_mode = False
+        self.logger.info('transitioning to manual mode, task stopped')
+
+        if abort:
+            self.acquired_data = None
+            self.buffered_chans = None
+            self.h5_file = None
+            return True
+
+        with h5py.File(self.h5_file, 'a') as hdf5_file:
+            data_group = hdf5_file['data']
+            data_group.create_group(self.device_name)
+
+        if self.buffered_chans is not None and not self.acquired_data:
+            msg = """No data was acquired."""
+            raise RuntimeError(dedent(msg))
+
+        if self.acquired_data:
+            start_time = time.time()
+            raw_data = self.acquired_data
+            self.extract_measurements(raw_data)
+            self.acquired_data = None
+            self.buffered_chans = None
+            self.h5_file = None
+            self.buffered_rate = None
+            msg = 'data written, time taken: %ss' % str(time.time() - start_time)
+        else:
+            msg = 'No acquisitions in this shot.'
+        self.logger.info(msg)
+
+        return True
+
+    def extract_measurements(self, raw_data):
+        self.logger.debug('extract_measurements')
+
+        with h5py.File(self.h5_file, 'a') as hdf5_file:
+            try:
+                acquisitions = hdf5_file['/devices/' + self.device_name + '/CI']
+            except KeyError:
+                # No acquisitions!
+                return
+            try:
+                measurements = hdf5_file['/data/counts']
+            except KeyError:
+                # Group doesn't exist yet, create it:
+                measurements = hdf5_file.create_group('/data/counts')
+
+            for connection, _, _, label in acquisitions: # Order defined in NI_DAQmx/labscript_devices.py
+                data = np.uint32(raw_data[connection.decode()].value)
+                measurements.create_dataset(label, data=data)
+
+    def _set_count_task(self, task, inst):
+        def fix_term_name(name: str):
+            if '/' not in name:
+                name = f"{self.MAX_name}/{name}"
+                return name
+
+        chan = fix_term_name(inst['connection'])
+        edge = inst['edge']
+        gate = inst['gate']
+
+        try:
+            task.CreateCICountEdgesChan(
+                chan, "", DAQmx_Val_Rising, 0, DAQmx_Val_CountUp
+            )
+            task.SetPauseTrigType(DAQmx_Val_DigLvl)
+            task.SetDigLvlPauseTrigWhen(DAQmx_Val_Low);
+            task.SetDigLvlPauseTrigSrc(gate);
+        finally:
+            pass
 
     def abort_buffered(self):
         return self.transition_to_manual(True)

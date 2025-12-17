@@ -77,6 +77,19 @@ class NI_DAQmxTab(DeviceTab):
         # communicate with the device:
         self.MAX_name = properties['MAX_name']
 
+        # Check hardware lines connected to PFI ports used as inputs
+        import numpy as np
+        DIO_used_as_inputs = np.empty((0,), dtype=object)
+        try:
+            with h5py.File(connection_table.filepath, 'r') as f:
+                group = f.get(f"devices/{self.device_name}")
+                if group and 'CI' in group:
+                   used_pfies = group['CI'].attrs['used_pfies']
+                   DIO_used_as_inputs = np.union1d(DIO_used_as_inputs, used_pfies)
+        except Exception:
+            pass
+        DIO_used_as_inputs = list(map(lambda pfi: properties['PFI_connections'][pfi], DIO_used_as_inputs))
+
         # Create output objects:
         AO_prop = {}
         for i in range(num_AO):
@@ -95,6 +108,8 @@ class NI_DAQmxTab(DeviceTab):
             port_props = {}
             for line in range(ports[port_str]['num_lines']):
                 hardware_name = 'port%d/line%d' % (port_num, line)
+                if hardware_name in DIO_used_as_inputs:
+                    continue
                 port_props[hardware_name] = {}
                 DO_hardware_names.append(hardware_name)
             DO_proplist.append((port_str, port_props))
@@ -118,6 +133,8 @@ class NI_DAQmxTab(DeviceTab):
         widget_list = [("Analog outputs", AO_widgets, split_conn_AO)]
         for port_num in range(len(ports)):
             port_str ='port%d' % port_num
+            if port_str not in DO_widgets_by_port:
+                continue
             DO_widgets = DO_widgets_by_port[port_str]
             name = "Digital outputs: %s" % port_str
             if ports[port_str]['supports_buffered']:
@@ -212,6 +229,16 @@ class NI_DAQmxTab(DeviceTab):
                 },
             )
             self.add_secondary_worker("acquisition_worker")
+
+        if num_CI > 0:
+            self.create_worker(
+                "counter_worker",
+                'labscript_devices.NI_DAQmx.blacs_workers.NI_DAQmxCounterWorker',
+                {
+                    'MAX_name': self.MAX_name
+                },
+            )
+            self.add_secondary_worker("counter_worker")
 
         # Set the capabilities of this device
         self.supports_remote_value_check(False)

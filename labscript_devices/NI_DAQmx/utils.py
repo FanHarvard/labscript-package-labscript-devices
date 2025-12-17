@@ -72,3 +72,13 @@ def split_conn_port(connection):
     except (ValueError, IndexError):
         msg = "port string %s does not match format 'port<N>' for integer N"
         raise ValueError(msg % str(connection))
+
+
+def split_conn_CI(connection):
+    """Return counter input number of a connection string such as 'ctr0' as an
+    integer, or raise ValueError if format is invalid"""
+    try:
+        return int(connection.split('ctr', 1)[1])
+    except (ValueError, IndexError):
+        msg = "Counter input connection string %s does not match format 'ctr<N>' for integer N"
+        raise ValueError(msg % str(connection))
