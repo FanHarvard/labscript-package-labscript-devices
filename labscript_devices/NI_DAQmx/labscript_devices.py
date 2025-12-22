@@ -555,7 +555,8 @@ class NI_DAQmx(IntermediateDevice):
         for connection, counter in counters.items():
             edge = counter.edge_terminal
             gate = counter.gate_terminal
-            for term in (edge, gate):
+            sample = counter.sample_terminal
+            for term in (edge, gate, sample):
                 if term and 'PFI' in term and term not in pfies_used_in_counters:
                     pfies_used_in_counters.append(term)
             for acq in counter.acquisitions:
@@ -563,7 +564,11 @@ class NI_DAQmx(IntermediateDevice):
                     (
                         connection,
                         edge,
-                        gate,
+                        gate if gate is not None else '',
+                        sample if sample is not None else '',
+                        acq["max_sampling_rate"],
+                        acq["buffer_size"],
+                        acq["polling_interval"],
                         acq['label']
                     )
                 )
@@ -571,6 +576,10 @@ class NI_DAQmx(IntermediateDevice):
             ('connection', 'a256'),
             ('edge terminal', 'a256'),
             ('gate terminal', 'a256'),
+            ('sample terminal', 'a256'),
+            ('max_sampling_rate', 'f8'),
+            ('buffer_size', 'u4'),
+            ('polling_interval', 'f8'),
             ('label', 'a256')
         ]
         counter_table = np.empty(len(acquisitions), dtype=counter_table_dtypes)
