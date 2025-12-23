@@ -31,8 +31,16 @@ from labscript_utils.connections import _ensure_str
 
 from blacs.tab_base_classes import Worker
 
-from .utils import split_conn_port, split_conn_DO, split_conn_AI
+from .utils import split_conn_port, split_conn_DO, split_conn_AI, split_conn_CI
 from .daqmx_utils import incomplete_sample_detection
+
+import json
+from pathlib import Path
+
+import PyDAQmx
+
+from pythonlib.data_saver import DataSaver
+from pythonlib.online_monitor import OnlineMonitor
 
 
 class NI_DAQmxOutputWorker(Worker):
@@ -40,7 +48,7 @@ class NI_DAQmxOutputWorker(Worker):
         self.check_version()
         # Reset Device: clears previously added routes etc. Note: is insufficient for
         # some devices, which require power cycling to truly reset.
-        DAQmxResetDevice(self.MAX_name)
+        DAQmxResetDevice(self.MAX_name) #TODO
         self.start_manual_mode_tasks()
 
     def stop_tasks(self):
@@ -79,7 +87,8 @@ class NI_DAQmxOutputWorker(Worker):
             self.AO_task = None
 
         if self.ports:
-            self.DO_task = Task()
+            self.DO_task = None
+            # self.DO_task = Task() # TODO
         else:
             self.DO_task = None
 
@@ -96,7 +105,7 @@ class NI_DAQmxOutputWorker(Worker):
                 continue
             # Add each port to the task:
             con = '%s/%s' % (self.MAX_name, port_str)
-            self.DO_task.CreateDOChan(con, "", DAQmx_Val_ChanForAllLines)
+            # self.DO_task.CreateDOChan(con, "", DAQmx_Val_ChanForAllLines) # TODO
 
         # Start tasks:
         if self.AO_task is not None:
@@ -693,6 +702,275 @@ class NI_DAQmxAcquisitionWorker(Worker):
 
     def program_manual(self, values):
         return {}
+
+
+class NI_DAQmxCounterWorker(Worker):
+    """Counter acquisition using CI table."""
+
+    def init(self):
+        # Prevent interference between the read callback and the shutdown code:
+        self.tasklock = threading.RLock()
+
+        # Assigned on a per-shot basis and cleared afterward:
+        self.buffered_mode = False
+        self.h5_file = None
+        self.instructions = []
+        self.buffered_chans = []
+        self.data_buffer = []
+        self.daq_status = []
+        self.data_saver = []
+        self.online_monitor = None
+
+        self.tasks = []
+        self.thread_polling_data = []
+        self.event_task_stopped = None
+
+    def shutdown(self):
+        if len(self.tasks) > 0:
+            self._stop_task()
+
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
+        self.logger.debug('transition_to_buffered')
+
+        self.h5_file = h5file
+        with h5py.File(h5file, 'r') as f:
+            group = f['/devices/' + device_name]
+            if 'CI' not in group:
+                return initial_values
+            ci_table = group['CI'][:]
+
+        self.instructions = []
+        self.buffered_chans = []
+        self.data_buffer = []
+        self.daq_status = []
+        self.data_saver = []
+        self.online_monitor = OnlineMonitor()
+
+        for i_task, row in enumerate(ci_table):
+            self.instructions.append(
+                {
+                    'connection': _ensure_str(row['connection']),
+                    'edge': _ensure_str(row['edge terminal']),
+                    'gate': _ensure_str(row['gate terminal']),
+                    'sample': _ensure_str(row['sample terminal']),
+                    'max_sampling_rate': row['max_sampling_rate'],
+                    'buffer_size': row['buffer_size'],
+                    'polling_interval': row['polling_interval'],
+                    'label': _ensure_str(row['label']),
+                }
+            )
+            instruction = self.instructions[-1]
+
+            self.buffered_chans.append(instruction["connection"])
+            self.data_buffer.append(np.zeros((instruction["buffer_size"],), dtype=np.uint32))
+            self.daq_status.append({})
+            self.data_saver.append(
+                DataSaver(
+                    self.h5_file,
+                    device_name=self.device_name,
+                    acquisition_type="count",
+                    data_label=instruction["label"]
+                )
+            )
+        
+        self.buffered_mode = True
+        self._start_task(self.instructions)
+
+        return {}
+
+    def transition_to_manual(self, abort=False):
+        self.logger.debug('transition_to_manual')
+
+        if not self.buffered_mode:
+            return True
+        if len(self.buffered_chans) > 0:
+            self._stop_task()
+
+        if abort:
+            for status in self.daq_status:
+                status["aborted"] = True
+
+        for data_saver, daq_status in zip(self.data_saver, self.daq_status):
+            data_saver.add_attribute("daq_status", json.dumps(daq_status))
+            data_saver.merge_into_shot(cleanup=not abort)
+
+        self.buffered_mode = False
+        self.h5_file = None
+        self.instructions = []
+        self.buffered_chans = []
+        self.data_buffer = []
+        self.daq_status = []
+        self.data_saver = []
+        self.online_monitor.close()
+        self.online_monitor = None
+
+        self.logger.info('transitioning to manual mode, task stopped')
+
+        return True
+
+    def abort_buffered(self):
+        return self.transition_to_manual(True)
+
+    def abort_transition_to_buffered(self):
+        return self.transition_to_manual(True)
+
+    def program_manual(self, values):
+        return {}
+
+    def _read_data(self, task, read_samples: int, timeout: float, buffer: np.array, daq_status=None):
+        try:
+            buffer_size = buffer.shape[0]
+            samples_per_channel_read = PyDAQmx.DAQmxTypes.int32()
+
+            task.ReadCounterU32(read_samples, timeout, buffer, buffer_size, PyDAQmx.byref(samples_per_channel_read), None)
+
+            if samples_per_channel_read.value == buffer_size:
+                sys.stderr.write("Data overflow happened in counter. Increase the buffer size.\n")
+                if not daq_status is None:
+                    daq_status["has_overflow"] = True
+
+            return int(samples_per_channel_read.value)
+        except SamplesNotYetAvailableError:
+            return 0 
+        except DAQmxError as e:
+            msg = str(e)
+            if "-200284" in msg: # Timeout error
+                return 0
+            raise
+
+    def _poll_data(self, i_task: int, interval: float):
+        while not self.event_task_stopped.is_set():
+            samples_read = self._read_data(
+                self.tasks[i_task],
+                PyDAQmx.DAQmxConstants.DAQmx_Val_Auto,
+                0,
+                self.data_buffer[i_task],
+                self.daq_status[i_task],
+            )
+
+            if samples_read > 0 and self.data_saver:
+                data = np.array(self.data_buffer[i_task][:samples_read], copy=True)
+                saver = self.data_saver[i_task]
+                ds_name = "data"
+                with saver.open_data_file() as f:
+                    if ds_name not in f:
+                        f.create_dataset(
+                            ds_name,
+                            data=data,
+                            maxshape=(None,),
+                            chunks=True,
+                            dtype=data.dtype,
+                        )
+                    else:
+                        ds = f[ds_name]
+                        old_len = ds.shape[0]
+                        ds.resize((old_len + samples_read,))
+                        ds[old_len:] = data
+
+            if samples_read > 0 and self.online_monitor:
+                dummy_interval = interval * 1e9 / samples_read # in nanoseconds
+
+                now_ns = time.time_ns()
+
+                for i_sample in range(samples_read):
+                    self.online_monitor.send_point(
+                        measurement="count",
+                        tags={
+                            "shot_file": Path(self.h5_file).stem,
+                            "device_name": self.device_name,
+                        },
+                        fields={
+                            self.instructions[i_task]["label"]: self.data_buffer[i_task][i_sample],
+                        },
+                        timestamp_ns=now_ns - dummy_interval * (samples_read - i_sample - 1)
+                    )
+
+            time.sleep(interval)
+
+    def _set_count_task(self, task, inst):
+        """Set count task.
+
+        Buffer size specification must be matched in that in transition_to_buffered method.
+        """
+        def fix_term_name(name: str):
+            if '/' not in name:
+                name = f"{self.MAX_name}/{name}"
+            return name
+
+        chan = fix_term_name(inst['connection'])
+        edge = inst['edge']
+        gate = inst['gate']
+        sample = inst['sample']
+        max_sampling_rate = inst["max_sampling_rate"]
+        buffer_size = inst["buffer_size"]
+
+        try:
+            task.CreateCICountEdgesChan(
+                chan, "", PyDAQmx.DAQmxConstants.DAQmx_Val_Rising, 0, PyDAQmx.DAQmxConstants.DAQmx_Val_CountUp
+            )
+            if edge:
+                task.SetCICountEdgesTerm(chan, edge)
+            if gate:
+                task.SetPauseTrigType(PyDAQmx.DAQmxConstants.DAQmx_Val_DigLvl)
+                task.SetDigLvlPauseTrigWhen(PyDAQmx.DAQmxConstants.DAQmx_Val_Low);
+                task.SetDigLvlPauseTrigSrc(gate);
+            if sample:
+                task.CfgSampClkTiming(sample, max_sampling_rate, PyDAQmx.DAQmxConstants.DAQmx_Val_Rising, PyDAQmx.DAQmxConstants.DAQmx_Val_ContSamps, buffer_size)
+        finally:
+            pass
+
+    def _start_task(self, insts: list[dict]):
+        if len(self.tasks) > 0:
+            raise RuntimeError('Task already running')
+
+        self.tasks = []
+        self.thread_polling_data = []
+        self.event_task_stopped = None
+
+        for i_task, inst in enumerate(insts):
+            self.tasks.append(PyDAQmx.Task())
+            self._set_count_task(self.tasks[-1], inst)
+            self.thread_polling_data.append(
+                threading.Thread(
+                    target=self._poll_data,
+                    args=(i_task, inst["polling_interval"]),
+                    daemon=True
+                )
+            )
+
+        self.event_task_stopped = threading.Event()
+
+        for i_task, task in enumerate(self.tasks):
+            task.StartTask()
+            self.thread_polling_data[i_task].start()
+
+    def _stop_task(self):
+        with self.tasklock:
+            if len(self.tasks) == 0:
+                raise RuntimeError('Task not running')
+
+            self.event_task_stopped.set()
+
+            for i_task, task in enumerate(self.tasks):
+                task.StopTask()
+                self.thread_polling_data[i_task].join()
+
+                data_buffer = self.data_buffer[i_task]
+                query_sample_size = data_buffer.shape[0]
+
+                while query_sample_size > 0:
+                    read_sample_size = self._read_data(task, query_sample_size, 0, data_buffer)
+                    
+                    if read_sample_size == 0:
+                        query_sample_size -= 1
+                    else:
+                        break
+
+                task.ClearTask()
+
+            self.tasks = []
+            self.thread_polling_data = []
+            self.event_task_stopped = None
 
 
 class NI_DAQmxWaitMonitorWorker(Worker):

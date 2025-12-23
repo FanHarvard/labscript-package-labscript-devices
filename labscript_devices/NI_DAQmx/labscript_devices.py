@@ -1,3 +1,5 @@
+# TODO
+# Remove ports used as input (e.g. in counters) from DO ports
 #####################################################################
 #                                                                   #
 # /NI_DAQmx/models/labscript_devices.py                             #
@@ -21,6 +23,7 @@ from labscript import (
     StaticAnalogOut,
     StaticDigitalOut,
     AnalogIn,
+    Counter,
     bitfield,
     config,
     compiler,
@@ -28,7 +31,7 @@ from labscript import (
     set_passed_properties,
 )
 from labscript_utils import dedent
-from .utils import split_conn_DO, split_conn_AO, split_conn_AI
+from .utils import split_conn_DO, split_conn_AO, split_conn_AI, split_conn_CI
 import numpy as np
 import warnings
 
@@ -76,6 +79,7 @@ class NI_DAQmx(IntermediateDevice):
                 "num_AO",
                 "num_CI",
                 "ports",
+                "PFI_connections",
                 "supports_buffered_AO",
                 "supports_buffered_DO",
                 "supports_semiperiod_measurement",
@@ -116,6 +120,7 @@ class NI_DAQmx(IntermediateDevice):
         num_AO=0,
         num_CI=0,
         ports=None,
+        PFI_connections=None,
         supports_buffered_AO=False,
         supports_buffered_DO=False,
         supports_semiperiod_measurement=False,
@@ -181,6 +186,7 @@ class NI_DAQmx(IntermediateDevice):
             num_CI (int, optional): Number of counter input channels.
             ports (dict, optional): Dictionarly of DIO ports, which number of lines
                 and whether port supports buffered output.
+            PFI_connections (dict, optional): Dictionary of hardware connections e.g. PFIX to portX/lineX
             supports_buffered_AO (bool, optional): True if analog outputs support
                 buffered output
             supports_buffered_DO (bool, optional): True if digital outputs support
@@ -270,6 +276,7 @@ class NI_DAQmx(IntermediateDevice):
         self.num_AO = num_AO
         self.num_CI = num_CI
         self.ports = ports if ports is not None else {}
+        self.PFI_connections = PFI_connections if PFI_connections is not None else {}
         self.supports_buffered_AO = supports_buffered_AO
         self.supports_buffered_DO = supports_buffered_DO
         self.supports_semiperiod_measurement = supports_semiperiod_measurement
@@ -294,6 +301,8 @@ class NI_DAQmx(IntermediateDevice):
         '''Sets the allowed children types based on the capabilites.'''
         if self.num_AI > 0:
             self.allowed_children += [AnalogIn]
+        if self.num_CI > 0:
+            self.allowed_children += [Counter]
         if self.num_AO > 0 and static_AO:
             self.allowed_children += [StaticAnalogOut]
         if self.num_AO > 0 and not static_AO:
@@ -381,6 +390,17 @@ class NI_DAQmx(IntermediateDevice):
                     Even if there is no buffered output, a pseudoclock is still required
                     to trigger the start of acquisition. Please specify a parent_device
                     and clock_terminal for device %s"""
+                raise ValueError(dedent(msg) % self.name)
+        elif isinstance(device, Counter):
+            conn = device.connection
+            if '/' not in conn:
+                ci_num = split_conn_CI(conn)
+                if ci_num >= self.num_CI:
+                    msg = "Cannot add counter input '%s' to device with num_CI=%d"
+                    raise ValueError(dedent(msg) % (conn, self.num_CI))
+            if self.parent_device is None:
+                msg = """Cannot add counter input to device with no parent pseudoclock.
+                    Please specify a parent_device and clock_terminal for device %s"""
                 raise ValueError(dedent(msg) % self.name)
 
         IntermediateDevice.add_device(self, device)
@@ -525,6 +545,51 @@ class NI_DAQmx(IntermediateDevice):
 
         return acquisition_table
 
+    def _make_counter_input_table(self, counters):
+        """Collect counter input instructions and create the acquisition table"""
+        if not counters:
+            return None
+
+        pfies_used_in_counters = []
+        acquisitions = []
+        for connection, counter in counters.items():
+            edge = counter.edge_terminal
+            gate = counter.gate_terminal
+            sample = counter.sample_terminal
+            for term in (edge, gate, sample):
+                if term and 'PFI' in term and term not in pfies_used_in_counters:
+                    pfies_used_in_counters.append(term)
+            for acq in counter.acquisitions:
+                acquisitions.append(
+                    (
+                        connection,
+                        edge,
+                        gate if gate is not None else '',
+                        sample if sample is not None else '',
+                        acq["max_sampling_rate"],
+                        acq["buffer_size"],
+                        acq["polling_interval"],
+                        acq['label']
+                    )
+                )
+        counter_table_dtypes = [
+            ('connection', 'a256'),
+            ('edge terminal', 'a256'),
+            ('gate terminal', 'a256'),
+            ('sample terminal', 'a256'),
+            ('max_sampling_rate', 'f8'),
+            ('buffer_size', 'u4'),
+            ('polling_interval', 'f8'),
+            ('label', 'a256')
+        ]
+        counter_table = np.empty(len(acquisitions), dtype=counter_table_dtypes)
+        for i, acq in enumerate(acquisitions):
+            counter_table[i] = acq
+        attributes = {
+            'used_pfies': pfies_used_in_counters
+        }
+        return counter_table, attributes 
+
     def _check_wait_monitor_timeout_device_config(self):
         """Check that if we are the wait monitor acquisition device and another device
         is the wait monitor timeout device, that a) the other device is a DAQmx device
@@ -583,6 +648,7 @@ class NI_DAQmx(IntermediateDevice):
         analogs = {}
         digitals = {}
         inputs = {}
+        counters = {}
         for device in self.child_devices:
             if isinstance(device, (AnalogOut, StaticAnalogOut)):
                 analogs[device.connection] = device
@@ -590,6 +656,8 @@ class NI_DAQmx(IntermediateDevice):
                 digitals[device.connection] = device
             elif isinstance(device, AnalogIn):
                 inputs[device.connection] = device
+            elif isinstance(device, Counter):
+                counters[device.connection] = device
             else:
                 raise TypeError(device)
 
@@ -610,6 +678,7 @@ class NI_DAQmx(IntermediateDevice):
         AO_table = self._make_analog_out_table(analogs, times)
         DO_table = self._make_digital_out_table(digitals, times)
         AI_table = self._make_analog_input_table(inputs)
+        CI_table, CI_attr = self._make_counter_input_table(counters)
 
         self._check_AI_not_too_fast(AI_table)
         self._check_wait_monitor_timeout_device_config()
@@ -621,6 +690,10 @@ class NI_DAQmx(IntermediateDevice):
             grp.create_dataset('DO', data=DO_table, compression=config.compression)
         if AI_table is not None:
             grp.create_dataset('AI', data=AI_table, compression=config.compression)
+        if CI_table is not None:
+            grp.create_dataset('CI', data=CI_table, compression=config.compression)
+            for key, val in CI_attr.items():
+                grp['CI'].attrs[key] = val
 
 
 from .models import *
