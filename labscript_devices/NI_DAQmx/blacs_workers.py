@@ -35,8 +35,12 @@ from .utils import split_conn_port, split_conn_DO, split_conn_AI, split_conn_CI
 from .daqmx_utils import incomplete_sample_detection
 
 import json
+from pathlib import Path
+
 import PyDAQmx
+
 from pythonlib.data_saver import DataSaver
+from pythonlib.online_monitor import OnlineMonitor
 
 
 class NI_DAQmxOutputWorker(Worker):
@@ -715,6 +719,7 @@ class NI_DAQmxCounterWorker(Worker):
         self.data_buffer = []
         self.daq_status = []
         self.data_saver = []
+        self.online_monitor = None
 
         self.tasks = []
         self.thread_polling_data = []
@@ -739,6 +744,7 @@ class NI_DAQmxCounterWorker(Worker):
         self.data_buffer = []
         self.daq_status = []
         self.data_saver = []
+        self.online_monitor = OnlineMonitor()
 
         for i_task, row in enumerate(ci_table):
             self.instructions.append(
@@ -795,6 +801,8 @@ class NI_DAQmxCounterWorker(Worker):
         self.data_buffer = []
         self.daq_status = []
         self.data_saver = []
+        self.online_monitor.close()
+        self.online_monitor = None
 
         self.logger.info('transitioning to manual mode, task stopped')
 
@@ -839,6 +847,7 @@ class NI_DAQmxCounterWorker(Worker):
                 self.data_buffer[i_task],
                 self.daq_status[i_task],
             )
+
             if samples_read > 0 and self.data_saver:
                 data = np.array(self.data_buffer[i_task][:samples_read], copy=True)
                 saver = self.data_saver[i_task]
@@ -857,6 +866,25 @@ class NI_DAQmxCounterWorker(Worker):
                         old_len = ds.shape[0]
                         ds.resize((old_len + samples_read,))
                         ds[old_len:] = data
+
+            if samples_read > 0 and self.online_monitor:
+                dummy_interval = interval * 1e9 / samples_read # in nanoseconds
+
+                now_ns = time.time_ns()
+
+                for i_sample in range(samples_read):
+                    self.online_monitor.send_point(
+                        measurement="count",
+                        tags={
+                            "shot_file": Path(self.h5_file).stem,
+                            "device_name": self.device_name,
+                        },
+                        fields={
+                            self.instructions[i_task]["label"]: self.data_buffer[i_task][i_sample],
+                        },
+                        timestamp_ns=now_ns - dummy_interval * (samples_read - i_sample - 1)
+                    )
+
             time.sleep(interval)
 
     def _set_count_task(self, task, inst):
