@@ -16,6 +16,46 @@ import numpy as np
 
 import labscript_utils.properties as properties
 
+def _parse_do_bit_index(connection):
+    """Parse a PrawnDO digital output index from various connection formats.
+
+    Accepts:
+      - 'do1', 'do10'          (BLACS-style, decimal)
+      - '1', '10'              (decimal)
+      - '0xA', '0x0f'           (hex with 0x prefix)
+      - 'a', 'f', '0a', '0f'    (hex without 0x, if letters are present)
+    Returns:
+      - int index in [0, 15]
+    """
+    if not isinstance(connection, str):
+        return int(connection)
+
+    c = connection.strip().lower()
+
+    # BLACS-style: 'doN' is decimal
+    if c.startswith("do"):
+        rest = c[2:].strip()
+        if rest.isdigit():
+            return int(rest, 10)
+        # If someone ever uses 'do0xA'
+        if rest.startswith("0x"):
+            return int(rest, 16)
+        # Fall back to hex if letters exist
+        if any(ch in "abcdef" for ch in rest):
+            return int(rest, 16)
+
+    # Non-'do' formats:
+    if c.startswith("0x"):
+        return int(c, 16)
+
+    # If hex letters exist, treat as hex; otherwise treat as decimal
+    if any(ch in "abcdef" for ch in c):
+        return int(c, 16)
+
+    return int(c, 10)
+
+
+
 class PrawnDOParser(object):
     def __init__(self, path, device):
         self.path = path
@@ -82,7 +122,9 @@ class PrawnDOParser(object):
                 for internal_device_name, internal_device in clock_line.child_list.items():
                     for channel_name, channel in internal_device.child_list.items():
                         chan = channel.parent_port.split(' ')[-1]
-                        output_trace = (times_table, do_bitfield[:,int(chan,16)])
+                        bit_index = _parse_do_bit_index(chan)
+                        output_trace = (times_table, do_bitfield[:, bit_index])
+
                         digital_outs[channel_name] = output_trace
                         add_trace(channel_name, output_trace,
                                   self.name, channel.parent_port)
